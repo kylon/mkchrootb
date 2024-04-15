@@ -1,0 +1,907 @@
+#!/bin/bash
+# mkchrootb Copyright (C) 2024 kylon
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program.  If not, see <http://www.gnu.org/licenses/>.
+cachepath="/home/$(whoami)/.cache/mkchrootb"
+repopath="/var/lib/repo/aur"
+oldpath="$repopath/old"
+rdbpath="$repopath/aur.db.tar.gz"
+gitdbpath="$cachepath/gitdb"
+
+declare -A parsedArgs
+declare -a chrootIPkgList aurIPkgList pkgDList repoDList
+
+export CHROOT=/opt/chroot
+
+function showHelp() {
+    echo -e "Usage: mkchrootb [options]\n\noptions:"
+    echo -e "-c\n    clean cache\n"
+    echo -e "-cr\n    clean local repo\n"
+    echo -e "-co\n    clean local repo old pkgs\n"
+    echo -e "-cc\n    clean cache and rebuild chroot\n"
+    echo -e "-p pkg[,pkg2,pkg3,..]\n    install pkgs to chroot, comma separated list (official or local repo)\n"
+    echo -e "-a pkg[,pkg2,pkg3,..]\n    build pkgs from aur, comma separated list\n"
+    echo -e "-d pkg[,pkg2,pkg3,..]\n    uninstall pkgs, comma separated list\n"
+    echo -e "-da pkg[,pkg2,pkg3,..]\n    delete pkgs from local repo database, comma separated list\n"
+    echo -e "-l\n    build PKGBUILD in current path\n"
+    echo -e "-x\n    enable access to X server to build pkgs that run GUIs in build process\n"
+    echo -e "-r\n    add pkgs to local repo after build\n"
+    echo -e "-i\n    install pkgs after build\n"
+    echo -e "-u\n    update pkgs in local repo\n"
+    echo -e "-w\n    ask to view/edit PKGBUILD before build (vifm, vi or nano)\n"
+    echo -e "-k\n    do not remove package repo from cache folder (deleted by default after build)\n"
+    echo -e "-ss\n    create mkchrootb signing key\n"
+    echo -e "-s\n    sign database and pkgs\n"
+    echo -e "-us\n    remove database and pkgs signature\n"
+    echo -e "-h\n    this help\n"
+}
+
+function ask() {
+    local q="$1: "
+
+    echo -ne "$q"
+    read -r inpt
+}
+
+function askYN() {
+    local q="$1 [y/n]: "
+
+    while true; do
+        read -p "$q" -r inpt
+
+        if [[ "$inpt" == "y" || "$inpt" == "Y" || "$inpt" == "" ]]; then
+            return 0
+        elif [[ "$inpt" == "n" || "$inpt" == "N" ]]; then
+            return 1
+        fi
+    done
+}
+
+function print() {
+    printf "%b\n" "$*" >&2
+}
+
+function printHead() {
+    print "          | |      | |                   | | | |"
+    print " _ __ ___ | | _____| |__  _ __ ___   ___ | |_| |__"
+    print "| '_ \` _ \| |/ / __| '_ \| '__/ _ \ / _ \| __| '_ \\"
+    print "| | | | | |   < (__| | | | | | (_) | (_) | |_| |_) |"
+    print "|_| |_| |_|_|\_\___|_| |_|_|  \___/ \___/ \__|_.__/"
+    print "\n"
+}
+
+function hasArg() {
+    if [[ "${parsedArgs[$1]}" == "1" ]]; then
+        return 0
+    fi
+
+    return 1
+}
+
+function parseArguments() {
+    local args=($@)
+    local argc=${#args[@]}
+    local aidx=0
+
+    if ((argc<=0)); then
+        showHelp
+        exit 0
+    fi
+
+    while ((aidx < argc)); do
+        local _arg=$(echo "${args[aidx]}" | xargs)
+
+        parsedArgs+=([$_arg]="1")
+
+        case "$_arg" in
+            "-p"|"-a"|"-d"|"-da")
+                ((++aidx))
+                readarray -d "," -t plist < <(echo "${args[aidx]}" | xargs)
+                ;;
+            *);;
+        esac
+
+        if [[ "$_arg" == "-p" ]]; then
+            chrootIPkgList=(${plist[@]})
+        elif [[ "$_arg" == "-a" ]]; then
+            aurIPkgList=(${plist[@]})
+        elif [[ "$_arg" == "-d" ]]; then
+            pkgDList=(${plist[@]})
+        elif [[ "$_arg" == "-da" ]]; then
+            repoDList=(${plist[@]})
+        fi
+
+        ((++aidx))
+    done
+}
+
+function cleanCache() {
+    if [[ ! -d "$cachepath" ]]; then
+        return
+    fi
+
+    local db=""
+
+    if [[ -f "$gitdbpath" ]] && askYN "do you want to keep git pkgs update hash cache?"; then
+        db=$(cat "$gitdbpath")
+    fi
+
+    rm -rf "$cachepath/"*
+
+    if [[ "$db" != "" ]]; then
+        echo "$db" > "$gitdbpath"
+    fi
+}
+
+function cleanCacheChroot() {
+    if [[ ! -d "$CHROOT" ]]; then
+        return
+    fi
+
+    sudo rm -rf "$CHROOT"
+    cleanCache
+}
+
+function cleanup() {
+    if hasArg "-x"; then
+        xhost -local:
+    fi
+
+    unset CHROOT
+    unset -v chrootIPkgList aurIPkgList pkgDList repoDList parsedArgs
+}
+
+function getGpgHome() {
+    local gpgfold="${MKCHROOTB_GPGHOME}"
+
+    if [[ "$gpgfold" == "" ]]; then
+        gpgfold="/home/$(whoami)/.mkchrootb-gpg"
+    fi
+
+    echo "$gpgfold"
+}
+
+function addToRepo() {
+    local hasS="${parsedArgs[-s]}"
+    local rmList=""
+    local zstList=""
+    local gpgHome=""
+    local ret=1
+
+    if [[ ! -d "$oldpath" ]]; then
+        mkdir "$oldpath"
+    fi
+
+    for zst in *.zst; do # check if new pkgs already exist in repo
+        local _name=$(pacman -Qip "$zst" | grep -i name\ | awk -F":" '{ print $NF }' | xargs)
+        local _opkg="$repopath/$_name"
+
+        zstList+=" $zst"
+
+        if pacman -Sl aur|grep -i "$_name" &>/dev/null; then
+            rmList+=" $_name"
+        fi
+
+        if ls "$_opkg"*.zst &>/dev/null; then
+            cp -f "$_opkg"*.zst "$oldpath"
+            rm -f "$_opkg"*.zst
+
+            if ls "$_opkg"*.zst.sig &>/dev/null; then
+                cp -f "$_opkg"*.zst.sig "$oldpath"
+                rm -f "$_opkg"*.zst.sig
+            fi
+        fi
+    done
+
+    cp -f *.zst "$repopath" # cp new pkgs to local repo folder
+
+    if [[ "$hasS" == "1" ]]; then
+        gpgHome=$(getGpgHome)
+
+        signPkgs
+    fi
+
+    if [[ "$rmList" != "" ]]; then
+        if [[ "$hasS" == "1" ]]; then
+            GNUPGHOME="$gpgHome" repo-remove -v -s "$rdbpath" $rmList
+        else
+            repo-remove "$rdbpath" $rmList
+        fi
+    fi
+
+    if [[ "$hasS" == "1" ]]; then
+        GNUPGHOME="$gpgHome" repo-add -n -v -s "$rdbpath" $zstList
+        ret=$?
+
+    else
+        repo-add -n "$rdbpath" $zstList
+        ret=$?
+    fi
+
+    if [[ "$ret" == "0" ]]; then
+        arch-nspawn $CHROOT/root pacman -Syy
+        sudo pacman -Syy
+    fi
+}
+
+function removePkgFromRepo() {
+    local hasS="$1"
+    local pkg="$2"
+    local ret=1
+
+    if [[ "$hasS" == "1" ]]; then
+        repo-remove -v -s "$rdbpath" $pkg
+        ret=$?
+    else
+        repo-remove "$rdbpath" $pkg
+        ret=$?
+    fi
+
+    if [[ "$ret" == "0" ]]; then
+        rm -f "$repopath/$pkg"*.zst
+        rm -f "$repopath/$pkg"*.zst.sig &>/dev/null
+    fi
+}
+
+function uninstallPkgs() {
+    local ret=1
+
+    if askYN "do you want to remove pkg dependancies?"; then
+        sudo pacman -Rs ${pkgDList[@]}
+        ret=$?
+    else
+        sudo pacman -R ${pkgDList[@]}
+        ret=$?
+    fi
+
+    if [[ "$ret" != "0" ]]; then
+        print "\nfailed to uninstall pkgs: ${pkgDList[*]}"
+        exit 1
+
+    else
+        local hasS="${parsedArgs[-s]}"
+
+        for pkg in "${pkgDList[@]}"; do
+            removePkgFromRepo "$hasS" "$pkg"
+        done
+
+        sudo pacman -Syy
+    fi
+}
+
+function removePkgsFromRepo() {
+    local hasS="${parsedArgs[-s]}"
+
+    for pkg in "${repoDList[@]}"; do
+        removePkgFromRepo "$hasS" "$pkg"
+    done
+
+    sudo pacman -Syy
+}
+
+function getAurPkgListToInstall() {
+    local listLen=${#aurIPkgList[@]}
+    local -A flist
+    local i=0
+
+    while ((i < listLen)); do
+        local jmax=$((i+200)) # query limit
+        local j=$i
+        local qargs=""
+
+        while ((j < listLen && j < jmax)); do
+            qargs+="arg[]=${aurIPkgList[$j]}&"
+
+            ((++j))
+        done
+
+        readarray -t apiRes < <(curl -s "https://aur.archlinux.org/rpc/v5/info?$qargs" | jq '.results | .[] | .Name,.PackageBase' | tr -d '"')
+        local apiResLen=${#apiRes[@]}
+        local apiPkgC=$((apiResLen/2)) # res contains both pkg and pkgBase, we only need pkgs count
+        local c=$((j-i))
+        local a=0
+
+        if ((apiPkgC > c)); then
+            print "ERR: apiRes and aurIPkg window len mismatch"
+            cleanup
+            exit 1
+        fi
+
+        while ((i < j)); do
+            if [[ "$apiResLen" == "0" || "${aurIPkgList[$i]}" != "${apiRes[$a]}" ]]; then
+                print "WARN: orphan aur package: ${aurIPkgList[$i]}"
+
+            else
+                local b=$((a+1))
+
+                flist["${apiRes[$b]}"]="1"
+
+                ((a+=2))
+            fi
+
+            ((++i))
+        done
+    done
+
+    echo "${!flist[*]}"
+}
+
+function signPkgs() {
+    local gpgfold=$(getGpgHome)
+
+    for file in "$repopath/"*.zst; do
+        if [[ -f "$file.sig" ]]; then
+            continue
+        fi
+
+        gpg --homedir "$gpgfold" --output "$file.sig" --detach-sig "$file"
+    done
+}
+
+function unsignPkgs() {
+    rm -f "$repopath/"*.sig
+    sudo rm -f /var/lib/pacman/sync/aur.db.sig
+    sudo rm -f "$CHROOT/root/var/lib/pacman/sync/aur.db.sig"
+    sudo pacman -Syy
+
+    print "\nINFO: pkg and db signatures have been deleted, imported keys must be deleted by the user\n"
+}
+
+function setupSKey() {
+    local gpgfold=$(getGpgHome)
+
+    if [[ -f "$gpgfold/trustdb.gpg" ]]; then
+        return
+    fi
+
+    local who=$(whoami)
+
+    rm -R $gpgfold &>/dev/null
+    mkdir -m 700 $gpgfold
+
+cat >/tmp/mkchbk <<EOF
+    Key-Type: RSA
+    Key-Length: 4096
+    Subkey-Type: RSA
+    Subkey-Length: 4096
+    Name-Real: mkchrootb
+    Name-Comment: mkchrootb signing key
+    Name-Email: nomail@nop
+    Expire-Date: 1y
+    %commit
+    %echo done
+EOF
+
+    if ! gpg --homedir "$gpgfold" --batch --generate-key /tmp/mkchbk; then
+        return
+    fi
+
+    if gpg --homedir "$gpgfold" --export --armor --output "/home/$who/public-mkchrootb.asc"; then
+        print "\nINFO: mkchrootb key exported to /home/$who/public-mkchrootb.asc"
+        print "\n\nto import the key:"
+        print "sudo pacman-key -a /home/$who/public-mkchrootb.asc"
+        print "sudo pacman-key --lsign-key <mkchrootb keyid>"
+    else
+        print "\n\nERR: failed to export mkchrootb key!"
+    fi
+}
+
+function editPkgbuild() {
+    if ! hasArg "-w"; then
+        return
+    fi
+
+    local editors=""
+    local _tig=0
+    local sidx=0
+    local -a bins
+
+    if ! askYN "do you want to view/edit PKGBUILD?"; then
+        return
+    fi
+
+    if vifm -h &>/dev/null; then
+        editors+="$sidx] vifm "
+        bins+=("vifm")
+        ((++sidx))
+    fi
+
+    if nano -h &>/dev/null; then
+        editors+="$sidx] nano "
+        bins+=("nano")
+        ((++sidx))
+    fi
+
+    if vi -h &>/dev/null; then
+        editors+="$sidx] vi"
+        bins+=("vi")
+    fi
+
+    if [[ "$editors" == "" ]]; then
+        print "no editor found (vifm, nano, vi), skip.."
+        return
+    fi
+
+    if tig -h &>/dev/null; then
+        _tig=1
+    fi
+
+    while true; do
+        ask "$editors"
+
+        if [[ "${bins[$inpt]}" == "vifm" ]]; then
+            vifm "$1"
+        elif [[ "${bins[$inpt]}" == "nano" ]]; then
+            nano "$1/PKGBUILD"
+        else
+            vi "$1/PKGBUILD"
+        fi
+
+        if [[ "$_tig" == "1" ]] && askYN "do you want to review the changes in tig?"; then
+            cd "$1"
+            tig
+            cd ..
+        fi
+
+        if askYN "have you done editing?"; then
+            break
+        fi
+    done
+}
+
+function getGitHash() {
+    local srcinfoUrl="https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?h=$1"
+    local source=$(curl -s "$srcinfoUrl" | grep source\ = | head -n 1) # correct? don't see a way to check this
+    local gitUrl="${source#*git+}"
+    local hashLen=7
+    local awkArg="{print substr(\$0, 0, $hashLen)}"
+    local hash=""
+
+    if [[ "$gitUrl" == "" ]]; then
+        print "INFO: $1 has no source, skipping git hash check.."
+        hash="x"
+
+    elif [[ "$gitUrl" =~ "#" ]]; then
+        local qr="${gitUrl#*#}"
+        local gurl="${gitUrl%%#*}"
+
+        if [[ "$qr" =~ "branch=" || "$qr" =~ "tag=" ]]; then
+            local t="${qr#*=}"
+
+            if [[ "$qr" =~ "branch=" ]]; then
+                hash=$(git ls-remote "$gurl" -h "$t" | head -n 1 | awk "$awkArg")
+            else
+                hash=$(git ls-remote "$gurl" -t "$t" | head -n 1 | awk "$awkArg")
+            fi
+        else
+            hash=$(git ls-remote "$gitUrl" -t "$qr" | head -n 1 | awk "$awkArg") # try tag
+
+            if [[ "$hash" == "" ]]; then # commit hash
+                hash="${qr:0:$hashLen}"
+            fi
+        fi
+    else
+        hash=$(git ls-remote "$gitUrl" | head -n 1 | awk "$awkArg")
+    fi
+
+    echo "$hash"
+}
+
+function saveGitHash() {
+    local pkg="$1"
+    local hash=$(getGitHash "$pkg")
+    local cur=""
+
+    if [[ "$hash" == "" ]]; then
+        return
+    elif [[ -f "$gitdbpath" ]]; then
+        cur=$(cat "$gitdbpath" | grep "$pkg" | xargs)
+    fi
+
+    if [[ "$cur" == "" ]]; then
+        echo "$pkg=$hash" >> "$gitdbpath"
+    else
+        sed -i -E "s/!*$pkg=[a-z0-9A-Z]+/$pkg=$hash/" "$gitdbpath"
+    fi
+}
+
+function isLatestGit() {
+    local pkg="$1"
+    local hash=$(getGitHash "$pkg")
+
+    if [[ "$hash" == "x" ]]; then # child pkg or orphan, don't try to update
+        return 0
+
+    elif [[ "$hash" == "" || ! -f "$gitdbpath" ]]; then
+        return 1
+
+    else
+        local cur=$(cat "$gitdbpath" | grep "$pkg" | xargs)
+        local curhash="${cur#*=}"
+
+        if [[ "$curhash" == "" || "${cur:0:1}" == "!" ]]; then
+            return 1
+        elif [[ "$curhash" == "$hash" ]]; then
+            return 0
+        else
+            sed -i -E "s/!*$pkg/!$pkg/" "$gitdbpath"
+        fi
+    fi
+
+    return 1
+}
+
+function getUpdatePkgList() {
+    local -a pkgList
+    local -a pkgVerList
+    local -A ghosts
+    local toUpdList=""
+    local pkgListLen=0
+    local i=0
+
+    readarray -t repoPkgs < <(pacman -Sl aur)
+
+    for rpkg in "${repoPkgs[@]}"; do
+        readarray -d " " -t pdata < <(printf "%s" "$rpkg")
+
+        if [[ "${ghosts[${pdata[1]}]}" == "1" ]]; then
+            continue
+        fi
+
+        if [[ "${pdata[1]}" =~ "-git" ]]; then
+            if ! isLatestGit "${pdata[1]}"; then
+                toUpdList+=" ${pdata[1]}"
+
+            else # up to date, ignore children pkgs
+                local srcinfoUrl="https://aur.archlinux.org/cgit/aur.git/plain/.SRCINFO?h=${pdata[1]}"
+                local pkgsInPkg=($(curl -s "$srcinfoUrl" | grep pkgname\ = | cut -d "=" -f2 | xargs))
+
+                if ((${#pkgsInPkg[@]} > 1)); then
+                    for cpkg in "${pkgsInPkg[@]}"; do
+                        ghosts["$cpkg"]="1"
+                    done
+                fi
+            fi
+        else
+            pkgList+=("${pdata[1]}")
+            pkgVerList+=("${pdata[2]}")
+        fi
+    done
+
+    pkgListLen=${#pkgList[@]}
+
+    while ((i < pkgListLen)); do
+        local jmax=$((i+200)) # query limit
+        local j=$i
+        local qargs=""
+
+        while ((j < pkgListLen && j < jmax)); do
+            qargs+="arg[]=${pkgList[$j]}&"
+
+            ((++j))
+        done
+
+        readarray -t apiRes < <(curl -s "https://aur.archlinux.org/rpc/v5/info?$qargs" | jq '.results | .[] | .Name,.Version' | tr -d '"')
+        local apiResLen=${#apiRes[@]}
+        local apiPkgC=$((apiResLen/2)) # res contains both pkg and version, we only need pkgs count
+        local c=$((j-i))
+        local a=0
+
+        if ((apiPkgC > c)); then
+            print "ERR: apiRes and update pkgList window len mismatch"
+            cleanup
+            exit 1
+        fi
+
+        while ((i < j)); do
+            if [[ "$apiResLen" == "0" || "${pkgList[$i]}" != "${apiRes[$a]}" ]]; then
+                print "WARN: orphan aur package: ${pkgList[$i]}"
+
+            else
+                local v=$((a+1))
+
+                if [[ "${apiRes[$v]}" < "${pkgVerList[$i]}" ]]; then
+                    print "INFO: package downgrade: ${pkgList[$i]} ${pkgVerList[$i]} -> ${apiRes[$v]}"
+                    toUpdList+=" ${apiRes[$a]}"
+
+                elif [[ "${apiRes[$v]}" > "${pkgVerList[$i]}" ]]; then
+                    print "INFO: package upgrade: ${pkgList[$i]} ${pkgVerList[$i]} -> ${apiRes[$v]}"
+                    toUpdList+=" ${apiRes[$a]}"
+                fi
+
+                ((a+=2))
+            fi
+
+            ((++i))
+        done
+    done
+
+    echo "$toUpdList"
+}
+
+function updateRepoPkgs() {
+    local pkgUpdList=$(getUpdatePkgList)
+    local -a selectedPkgs
+    local i=0
+
+    if [[ "$pkgUpdList" == "" ]]; then
+        print "\nYou are up to date!"
+        cleanup
+        exit 0
+    fi
+
+    readarray -d " " -t updList < <(echo "$pkgUpdList" | xargs)
+    print "\n"
+
+    for pkg in "${updList[@]}"; do
+        printf "%d] %s " $i "$pkg"
+        ((++i))
+    done
+
+    ask "\nselect packages to update [enter=all, n=none]"
+
+    if [[ "$inpt" == "n" || "$inpt" == "N" ]]; then
+        cleanup
+        exit 0
+
+    elif [[ "$inpt" == "" ]]; then
+        selectedPkgs="${updList[*]}"
+
+    else
+        local -a userSel
+
+        readarray -d " " -t selectedPkgs < <(echo "$inpt" | xargs)
+
+        for idx in "${selectedPkgs[@]}"; do
+            if [[ "$idx" =~ "-" ]]; then
+                readarray -d "-" -t idxs < <(echo "$idx" | xargs)
+
+                local jdx="${idxs[0]}"
+                local edx="${idxs[1]}"
+
+                while ((jdx<=edx)); do
+                    userSel[jdx]="${updList[$jdx]}"
+                    ((++jdx))
+                done
+            else
+                userSel[idx]="${updList[$idx]}"
+            fi
+        done
+
+        selectedPkgs="${userSel[*]}"
+    fi
+
+    print "\npackages to update:\n$selectedPkgs\n"
+
+    if ! askYN "do you want to proceed?"; then
+        cleanup
+        exit 0
+    fi
+
+    buildFromAur "$selectedPkgs" "0" "1"
+}
+
+function buildFromAur() {
+    local list=($1)
+    local instPkgs="$2"
+    local toRepo="$3"
+    local pwdbak=$(pwd)
+    local failed=""
+    local ret=1
+
+    cd "$cachepath"
+
+    if [[ "$instPkgs" == "1" ]]; then
+        if [[ -d "instdir" ]]; then
+            rm -rf instdir
+        fi
+
+        mkdir instdir
+    fi
+
+    for pkg in "${list[@]}"; do
+        if ! hasArg "-k" && [[ -d "$pkg" ]]; then
+            rm -rf "$pkg"
+        fi
+
+        if [[ -d "$pkg" ]]; then
+            rm -f "$pkg/"*.zst
+            git -C "$pkg" pull
+            ret=$?
+
+        else
+            git clone "https://aur.archlinux.org/$pkg.git"
+            ret=$?
+        fi
+
+        if [[ "$ret" != "0" || ! -d "$pkg" ]]; then
+            failed+=" $pkg"
+            continue
+        fi
+
+        editPkgbuild "$pkg"
+        cd "$pkg"
+
+        if [[ ! -f "PKGBUILD" ]]; then
+            print "$pkg: no PKGBUILD, skip.."
+            cd ..
+            failed+=" $pkg"
+            continue
+        fi
+
+        makechrootpkg -c -r $CHROOT
+
+        if [[ "$?" != "0" ]]; then
+            cd ..
+            rm -rf "$pkg"
+            failed+=" $pkg"
+            continue
+        fi
+
+        if [[ "$toRepo" == "1" ]]; then
+            addToRepo
+
+            if [[ "$pkg" =~ "-git" ]]; then
+                saveGitHash "$pkg"
+            fi
+        fi
+
+        if [[ "$instPkgs" == "1" ]]; then
+            cp -f *.zst ../instdir
+        fi
+
+        cd ..
+
+        if ! hasArg "-k"; then
+            rm -rf "$pkg"
+        fi
+    done
+
+    if [[ "$instPkgs" == "1" ]]; then
+        sudo pacman -U "instdir/"*.zst
+        rm -rf instdir
+    fi
+
+    cd "$pwdbak"
+
+    if [[ "$failed" != "" ]]; then
+        print "\n\nfailed to build:$failed"
+    fi
+}
+
+function addLocalAurRepo() {
+    local sync=0
+
+    if ! cat /etc/pacman.conf|grep "[aur]" > /dev/null; then
+        sync=1
+
+        print "INFO: adding local [aur] repo to pacman.conf"
+        sudo tee -a "/etc/pacman.conf" > /dev/null <<EOF
+
+[aur]
+SigLevel = PackageOptional DatabaseOptional
+Server = file://$repopath
+EOF
+    fi
+
+    if [[ ! -d "$repopath" ]]; then
+        local who=$(whoami)
+
+        sudo mkdir -m 775 -p "$repopath"
+        sudo chown -R "$who:$who" "$repopath"
+        touch "$repopath/aur.db"
+        sync=1
+    fi
+
+    if [[ "$sync" == "1" ]]; then
+        sudo pacman -Syy
+    fi
+}
+
+function createChroot() {
+    if [[ ! -d "$CHROOT" ]]; then
+        mkdir "$CHROOT"
+        mkarchroot -C /etc/pacman.conf -M /etc/makepkg.conf $CHROOT/root base-devel ccache git clang lld llvm cmake ninja
+    fi
+
+    if [[ ! -d "$cachepath" ]]; then
+        print "INFO: making mkchrootb cache folder..."
+        mkdir -p "$cachepath"
+    fi
+}
+
+function mkchrootb() {
+    parseArguments "$@"
+    printHead
+
+    if hasArg "-h"; then
+        showHelp
+        exit 0
+    fi
+
+    addLocalAurRepo
+
+    if hasArg "-d"; then
+        uninstallPkgs
+    fi
+
+    if hasArg "-da"; then
+        removePkgsFromRepo
+    fi
+
+    if hasArg "-cc"; then
+        cleanCacheChroot
+    elif hasArg "-c"; then
+        cleanCache
+    fi
+
+    if hasArg "-cr"; then
+        rm -rf "$repopath"
+        sudo pacman -Syy
+
+    elif hasArg "-co"; then
+        rm -rf "$oldpath"
+    fi
+
+    createChroot
+    arch-nspawn "$CHROOT/root" pacman -Syu
+
+    if hasArg "-us"; then
+        unsignPkgs
+
+    elif hasArg "-ss"; then
+        setupSKey
+        exit 0
+    fi
+
+    if hasArg "-p"; then
+        arch-nspawn "$CHROOT/root" pacman -S ${chrootIPkgList[@]}
+    fi
+
+    if hasArg "-x"; then
+        xhost +local:
+        echo "DISPLAY=:0" | sudo tee -a "$CHROOT/root/etc/environment"
+    fi
+
+    if hasArg "-u"; then
+        updateRepoPkgs
+    fi
+
+    if hasArg "-a"; then
+        local aPkgIList=$(getAurPkgListToInstall)
+
+        buildFromAur "$aPkgIList" "${parsedArgs[-i]}" "${parsedArgs[-r]}"
+    fi
+
+    if hasArg "-l"; then
+        editPkgbuild "."
+        makechrootpkg -c -r $CHROOT
+
+        if [[ "$?" == "0" ]]; then
+            if hasArg "-r"; then
+                addToRepo
+            fi
+
+            if hasArg "-i"; then
+                sudo pacman -U *.zst
+            fi
+        else
+            print "\n\nfailed to build"
+        fi
+    fi
+}
+
+mkchrootb "$@"
+cleanup
+exit 0
