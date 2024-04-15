@@ -1,6 +1,6 @@
 mkchrootb
 
-chroot-only AUR helper written in bash
+chroot-only AUR helper written in bash ([AUR package](https://aur.archlinux.org/packages/mkchrootb))
 
 features:
 - chroot-only
