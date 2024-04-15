@@ -145,17 +145,17 @@ function cleanCache() {
 }
 
 function cleanCacheChroot() {
-    if [[ ! -d "$CHROOT" ]]; then
-        return
+    if [[ -d "$CHROOT" ]]; then
+        sudo rm -rf "$CHROOT"
     fi
 
-    sudo rm -rf "$CHROOT"
     cleanCache
 }
 
 function cleanup() {
     if hasArg "-x"; then
         xhost -local:
+        sudo sed -i '$d' "$CHROOT/root/etc/environment"
     fi
 
     unset CHROOT
@@ -223,7 +223,6 @@ function addToRepo() {
     if [[ "$hasS" == "1" ]]; then
         GNUPGHOME="$gpgHome" repo-add -n -v -s "$rdbpath" $zstList
         ret=$?
-
     else
         repo-add -n "$rdbpath" $zstList
         ret=$?
