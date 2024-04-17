@@ -64,7 +64,7 @@ options:
     update pkgs in local repo
 
 -w
-    ask to view/edit PKGBUILD before build (vifm > nano > vi, first one found in that order)
+    ask to view/edit PKGBUILD before build (vifm, vi or nano)
 
 -k
     do not remove package repo from cache folder (deleted by default after build)
