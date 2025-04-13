@@ -850,7 +850,9 @@ function mkchrootb() {
         sudo pacman -Syy
 
     elif hasArg "-co"; then
-        rm -rf "$oldpath"
+        if [[ -d "$oldpath" ]]; then
+            rm -rf "$oldpath"
+        fi
     fi
 
     createChroot
