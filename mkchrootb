@@ -782,7 +782,7 @@ function buildFromAur() {
 function addLocalAurRepo() {
     local sync=0
 
-    if ! cat /etc/pacman.conf|grep "[aur]" > /dev/null; then
+    if ! cat /etc/pacman.conf|grep "\[aur\]" > /dev/null; then
         sync=1
 
         print "INFO: adding local [aur] repo to pacman.conf"
@@ -809,9 +809,18 @@ EOF
 }
 
 function createChroot() {
-    if [[ ! -d "$CHROOT" ]]; then
-        mkdir "$CHROOT"
+    if [[ ! -d "$CHROOT" ]] && ! mkdir "$CHROOT"; then
+        print "Failed to create chroot folder!"
+        exit 1
+    fi
+
+    if [[ "$(ls -A $CHROOT)" == "" ]]; then
         mkarchroot -C /etc/pacman.conf -M /etc/makepkg.conf $CHROOT/root base-devel ccache git clang lld llvm cmake ninja
+
+        if [[ "$?" != 0 ]]; then
+            print "Failed to create chroot!"
+            exit 1
+        fi
     fi
 
     if [[ ! -d "$cachepath" ]]; then
